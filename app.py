@@ -8,23 +8,46 @@ from geopy.extra.rate_limiter import RateLimiter
 import folium
 from urllib.parse import quote_plus, urlencode
 from datetime import datetime, timedelta, timezone
+from streamlit_javascript import st_javascript
+
+
+import pydeck as pdk  # ✅ mobile map
 
 # =========================================================
-# PitchFinder V3.6 — FULL SCRIPT (Streamlit)
-# =========================================================
-# ✅ "Y aller" (Apple Maps if iOS/macOS UA else Google Maps)
-# ✅ "Plan a game" moved to bottom of sidebar
-# ✅ Radius up to 20km (single slider; removed "use profile radius")
-# ✅ Apple Calendar (.ics download) + Google Calendar link (only when plan_mode ON)
-# ✅ Cards: always outlined; selected outline changes color
-# ✅ Selection unique via pitch_id (fix "all selected" bug)
-# ✅ Message:
-#    - plan_mode OFF: no date/time/players
-#    - plan_mode ON: includes date/time/players + calendars
-# ✅ No key= on st.link_button (older Streamlit compatibility)
-# ✅ Unique key= on st.download_button (fix DuplicateElementId)
+# PitchFinder V3.6 + MOBILE MODE
+# - Desktop: Folium (comme avant)
+# - Mobile: PyDeck (rapide, responsive)
+# - Mobile activation: ajoute ?mobile=1 à l'URL (recommandé)
+#   Ex: https://ton-app.streamlit.app/?mobile=1
 # =========================================================
 
+# ----------------------------
+# Page config (une seule fois)
+# ----------------------------
+st.set_page_config(
+    page_title="PitchFinder",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+# ----------------------------
+# Styles (petit polish mobile)
+# ----------------------------
+st.markdown(
+    """
+    <style>
+    .pf-title { font-size: 44px; font-weight: 800; margin: 0; }
+    .pf-sub { color: #6b7280; margin-top: -6px; }
+    .pf-muted { color:#6b7280; }
+    .pf-card { border-radius: 16px; }
+    .stButton > button { border-radius: 12px; }
+    .stTextInput input { border-radius: 12px; }
+    .stSelectbox div[data-baseweb="select"] { border-radius: 12px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ============================
 # Session state
@@ -40,7 +63,7 @@ def init_state():
         "origin_lat": None,
         "origin_lon": None,
 
-        # Plan defaults (editable anytime)
+        # Plan defaults
         "plan_mode": False,
         "plan_date": datetime.now().date(),
         "plan_time": datetime.now().replace(minute=0, second=0, microsecond=0).time(),
@@ -48,7 +71,7 @@ def init_state():
 
         # User identity for message
         "user_name": "Luc",
-        "user_style": "terrain",  # match or terrain
+        "user_style": "terrain",
 
         # Sticky search defaults
         "last_address": "Bordeaux, France",
@@ -57,13 +80,48 @@ def init_state():
         "last_paid_filter": "show_all",
         "last_radius_km": 5,
         "last_top_n": 10,
+
+        # Mobile mode flag
+        "mobile_mode": False,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
-
 init_state()
+
+def auto_is_mobile():
+    try:
+        qp = st.query_params
+        if str(qp.get("mobile", "0")).lower() in ("1","true","yes","y"):
+            return True
+        if str(qp.get("desktop", "0")).lower() in ("1","true","yes","y"):
+            return False
+    except Exception:
+        pass
+
+    w = st_javascript("window.innerWidth")
+    if w is None:
+        return st.session_state.mobile_mode
+    return int(w) < 768
+
+if "mobile_init_done" not in st.session_state:
+    st.session_state.mobile_mode = auto_is_mobile()
+    st.session_state.mobile_init_done = True
+
+# ============================
+# Mobile mode: URL param ?mobile=1 (recommandé)
+# ============================
+try:
+    qp = st.query_params
+    mobile_from_url = str(qp.get("mobile", "0")).lower() in ("1", "true", "yes", "y")
+except Exception:
+    mobile_from_url = False
+
+# On garde ton toggle dans la sidebar, mais par défaut on suit l’URL
+if "mobile_init_done" not in st.session_state:
+    st.session_state.mobile_mode = mobile_from_url
+    st.session_state.mobile_init_done = True
 
 # ============================
 # 1) Distance + Geocoding
@@ -76,12 +134,12 @@ def haversine_km(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
-
-_geolocator = Nominatim(user_agent="pitchfinder_streamlit_v36_folium")
+_geolocator = Nominatim(user_agent="pitchfinder_streamlit_v36_mobile")
 _geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1)
 
-
-def geocode_address(address: str):
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode_address_cached(address: str):
+    # cache = beaucoup plus rapide sur mobile
     if "france" not in address.lower():
         address = address + ", France"
     loc = _geocode(address)
@@ -89,11 +147,14 @@ def geocode_address(address: str):
         return None
     return (loc.latitude, loc.longitude)
 
+def geocode_address(address: str):
+    return geocode_address_cached(address)
 
 # ============================
 # 2) Overpass API (OpenStreetMap)
 # ============================
-def overpass_get_pitches(lat, lon, radius_m=3000):
+@st.cache_data(ttl=1800, show_spinner=False)
+def overpass_get_pitches_cached(lat, lon, radius_m=3000):
     query = f"""
     [out:json][timeout:40];
     (
@@ -121,6 +182,8 @@ def overpass_get_pitches(lat, lon, radius_m=3000):
 
     raise RuntimeError(f"Overpass API error (all endpoints failed). Last error: {last_error}")
 
+def overpass_get_pitches(lat, lon, radius_m=3000):
+    return overpass_get_pitches_cached(lat, lon, radius_m)
 
 # ============================
 # 3) Providers + links
@@ -137,10 +200,8 @@ def detect_provider(name: str) -> str:
         return "Five (generic)"
     return "Public/Other"
 
-
 def is_bookable_provider(provider: str) -> bool:
     return provider in ("UrbanSoccer", "Le Five")
-
 
 def provider_booking_link(provider: str) -> str:
     utm = "utm_source=pitchfinder&utm_medium=referral&utm_campaign=student_project"
@@ -150,7 +211,6 @@ def provider_booking_link(provider: str) -> str:
         return f"https://lefive.fr/?{utm}"
     return ""
 
-
 def gmaps_directions_link(origin_lat, origin_lon, dest_lat, dest_lon) -> str:
     return (
         f"https://www.google.com/maps/dir/?api=1"
@@ -158,14 +218,11 @@ def gmaps_directions_link(origin_lat, origin_lon, dest_lat, dest_lon) -> str:
         f"&destination={dest_lat},{dest_lon}"
     )
 
-
 def google_maps_place_link(dest_lat, dest_lon, label="Destination") -> str:
     return f"https://www.google.com/maps/search/?api=1&query={dest_lat},{dest_lon}({quote_plus(label)})"
 
-
 def apple_maps_place_link(dest_lat, dest_lon, label="Destination") -> str:
     return f"https://maps.apple.com/?ll={dest_lat},{dest_lon}&q={quote_plus(label)}"
-
 
 def go_button_html(dest_lat, dest_lon, label, element_id):
     g = google_maps_place_link(dest_lat, dest_lon, label)
@@ -197,7 +254,6 @@ def go_button_html(dest_lat, dest_lon, label, element_id):
       }})();
     </script>
     """
-
 
 # ============================
 # 4) Build DataFrame
@@ -241,12 +297,8 @@ def pitches_to_df(osm_json, user_lat, user_lon):
 
     df["distance_km"] = df["distance_km"].round(2)
     df["provider"] = df["name"].apply(detect_provider)
-
-    # ✅ Unique ID prevents multiple selection bug
     df["pitch_id"] = df.apply(lambda r: f"{r['lat']:.6f},{r['lon']:.6f}", axis=1)
-
     return df.sort_values("distance_km").reset_index(drop=True)
-
 
 # ============================
 # 5) Filters
@@ -267,13 +319,11 @@ def filter_by_pitch_type(df, pitch_type):
         ]
     return df
 
-
 def apply_paid_filter(df, paid_filter="show_all"):
     paid_filter = (paid_filter or "show_all").lower().strip()
     if paid_filter == "hide_paid":
         return df[~df["fee"].str.contains("yes|true", na=False)]
     return df
-
 
 # ============================
 # 6) Profiles + ETA + Score
@@ -285,13 +335,11 @@ PROFILES = {
 }
 SPEED_KMH = {"walk": 5, "car": 30}
 
-
 def add_eta_minutes(df, mode):
     speed = SPEED_KMH.get(mode, 5)
     out = df.copy()
     out["eta_min"] = (out["distance_km"] / speed * 60).round(0).astype(int)
     return out
-
 
 def add_recommendation_score(df, profile_name, pitch_type_selected):
     profile = PROFILES[profile_name]
@@ -333,11 +381,8 @@ def add_recommendation_score(df, profile_name, pitch_type_selected):
     out["stars5"] = (out["score_raw"] / 20).round().clip(lower=0, upper=5).astype(int)
     return out
 
-
 def profile_mode_label(profile_name: str) -> str:
-    # You asked: show "car" / "walk" (not the profile name)
     return PROFILES.get(profile_name, {}).get("mode", (profile_name or "").lower()).lower()
-
 
 # ============================
 # 7) Share + Calendar helpers
@@ -345,7 +390,6 @@ def profile_mode_label(profile_name: str) -> str:
 def stars_txt(n: int) -> str:
     n = max(0, min(5, int(n)))
     return "⭐" * n + "☆" * (5 - n)
-
 
 def format_share_message(
     user_name,
@@ -386,7 +430,6 @@ def format_share_message(
         f"🧭 Itinéraire: {directions_url}\n"
     )
 
-
 def google_calendar_link(title, start_dt, end_dt, details, location=""):
     start_utc = start_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     end_utc = end_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -398,7 +441,6 @@ def google_calendar_link(title, start_dt, end_dt, details, location=""):
         "location": location,
     }
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
-
 
 def build_ics_event(title, start_dt, end_dt, description, location=""):
     def esc(s: str) -> str:
@@ -427,7 +469,6 @@ def build_ics_event(title, start_dt, end_dt, description, location=""):
         "END:VCALENDAR",
     ]
     return "\r\n".join(lines)
-
 
 def copy_button(text: str, key: str, label: str = "Copier le message"):
     safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
@@ -458,11 +499,10 @@ def copy_button(text: str, key: str, label: str = "Copier le message"):
         height=55
     )
 
-
 # ============================
-# 8) Map (highlight selected + center/zoom)
+# 8) Desktop map (Folium)
 # ============================
-def make_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_lat=None, selected_lon=None):
+def make_folium_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_lat=None, selected_lon=None):
     if selected_lat is not None and selected_lon is not None:
         m = folium.Map(location=[selected_lat, selected_lon], zoom_start=16, control_scale=True)
     else:
@@ -509,12 +549,56 @@ def make_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_l
 
     return m
 
+# ============================
+# 9) Mobile map (PyDeck)
+# ============================
+def render_pydeck_map(origin_lat, origin_lon, df_top, selected_id=None, height=520):
+    df = df_top.copy()
+    df["is_selected"] = df["pitch_id"] == selected_id
+    if df["is_selected"].any():
+        focus = df[df["is_selected"]].iloc[0]
+        view_lat, view_lon = float(focus["lat"]), float(focus["lon"])
+        zoom = 15
+    else:
+        view_lat, view_lon = float(origin_lat), float(origin_lon)
+        zoom = 13
+
+    # Layer: points
+    layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=df,
+        get_position="[lon, lat]",
+        get_radius="is_selected ? 120 : 80",
+        pickable=True,
+    )
+
+    # Origin marker (as another layer)
+    origin_df = pd.DataFrame([{"lat": origin_lat, "lon": origin_lon}])
+    origin_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=origin_df,
+        get_position="[lon, lat]",
+        get_radius=140,
+        pickable=False,
+    )
+
+    tooltip = {
+        "html": "<b>{name}</b><br/>⭐ {stars5}/5<br/>{distance_km} km • ~{eta_min} min",
+        "style": {"fontSize": "12px"},
+    }
+
+    deck = pdk.Deck(
+        layers=[origin_layer, layer],
+        initial_view_state=pdk.ViewState(latitude=view_lat, longitude=view_lon, zoom=zoom),
+        tooltip=tooltip,
+        map_style="mapbox://styles/mapbox/streets-v11",  # marche sans clé (pydeck bascule)
+    )
+
+    st.pydeck_chart(deck, use_container_width=True, height=height)
 
 # ============================
-# 9) UI
+# HEADER
 # ============================
-st.set_page_config(page_title="PitchFinder", page_icon="⚽", layout="wide")
-
 st.markdown(
     """
     <div style="display:flex; align-items:baseline; gap:12px;">
@@ -526,9 +610,19 @@ st.markdown(
 )
 st.caption("ETA = Estimated Travel Time (minutes), based on your selected profile (walk/car).")
 
+# ============================
 # Sidebar
+# ============================
 with st.sidebar:
     st.header("Search")
+
+    # ✅ Mobile toggle (en plus du param URL)
+    st.session_state.mobile_mode = st.checkbox(
+        "📱 Mode mobile (recommandé sur tel)",
+        value=st.session_state.mobile_mode
+    )
+    if st.session_state.mobile_mode:
+        st.caption("Astuce: utilise aussi l'URL avec `?mobile=1` pour que ça reste activé sur ton téléphone.")
 
     with st.expander("👤 Profil utilisateur", expanded=True):
         st.session_state.user_name = st.text_input("Ton prénom", value=st.session_state.user_name)
@@ -538,7 +632,7 @@ with st.sidebar:
             index=0 if st.session_state.user_style == "match" else 1
         )
 
-    # --- Search form (Plan moved to bottom, outside the form) ---
+    # --- Search form ---
     with st.form("search_form"):
         address = st.text_input("Address", value=st.session_state.last_address)
 
@@ -564,13 +658,15 @@ with st.sidebar:
         st.markdown("**Rayon**")
         radius_km = st.slider("Rayon (km)", 1, 20, int(st.session_state.last_radius_km))
 
-        top_n = st.slider("Number of results", 5, 20, int(st.session_state.last_top_n))
+        # ✅ Mobile: moins de résultats par défaut (perf)
+        default_top = 10 if not st.session_state.mobile_mode else 8
+        top_n = st.slider("Number of results", 5, 20, int(st.session_state.last_top_n or default_top))
 
         run = st.form_submit_button("Search")
 
     st.divider()
 
-    # ✅ Plan a game at bottom, editable anytime (no need to Search first)
+    # ✅ Plan a game editable anytime
     st.subheader("Plan a game")
     st.session_state.plan_mode = st.checkbox("Plan a game (optional)", value=st.session_state.plan_mode)
 
@@ -583,7 +679,7 @@ with st.sidebar:
     st.caption("Plan OFF → message sans date/heure/joueurs + pas de calendrier.")
 
 # ============================
-# 10) Run pipeline
+# Run pipeline
 # ============================
 if run:
     st.session_state.last_error = None
@@ -593,7 +689,6 @@ if run:
     st.session_state.selected_lat = None
     st.session_state.selected_lon = None
 
-    # Persist latest search
     st.session_state.last_address = address
     st.session_state.last_profile_name = profile_name
     st.session_state.last_pitch_type = pitch_type
@@ -616,7 +711,6 @@ if run:
             if df.empty:
                 st.session_state.last_error = "No pitches found. Try increasing the radius or changing the address."
             else:
-                # Filter within chosen radius
                 df = df[df["distance_km"] <= float(radius_km)].copy()
                 if df.empty:
                     st.session_state.last_error = "No pitches within the selected radius."
@@ -650,7 +744,7 @@ if run:
         st.session_state.last_error = f"Error: {e}"
 
 # ============================
-# 11) Display results
+# Display results
 # ============================
 if st.session_state.last_error:
     st.error(st.session_state.last_error)
@@ -664,7 +758,15 @@ if df_top.empty:
     st.warning("No results to display.")
     st.stop()
 
-left, right = st.columns([1.25, 1])
+# ✅ Mobile layout: 1 colonne (résultats puis map)
+# ✅ Desktop layout: 2 colonnes (résultats | map)
+is_mobile = bool(st.session_state.mobile_mode)
+
+if not is_mobile:
+    left, right = st.columns([1.25, 1])
+else:
+    left = st.container()
+    right = st.container()
 
 with left:
     st.subheader("Top results")
@@ -685,7 +787,6 @@ with left:
 
         is_sel = (pitch_id == st.session_state.selected_pitch_id)
 
-        # ✅ Every card has outline; selected changes color
         border = "2px solid #ff8c00" if is_sel else "1.5px solid rgba(0,0,0,0.18)"
         bg = "rgba(255,140,0,0.06)" if is_sel else "rgba(255,255,255,0.02)"
         shadow = "0 6px 18px rgba(0,0,0,0.10)" if is_sel else "0 2px 8px rgba(0,0,0,0.06)"
@@ -721,7 +822,13 @@ with left:
         )
 
         # Actions: Highlight | Plan&Copy/Book | Y aller
-        c1, c2, c3 = st.columns([1, 1, 1])
+        # Mobile: boutons en colonne (plus lisible)
+        if is_mobile:
+            c1 = st.container()
+            c2 = st.container()
+            c3 = st.container()
+        else:
+            c1, c2, c3 = st.columns([1, 1, 1])
 
         with c1:
             if st.button("📍 Highlight", key=f"hl_{pitch_id}", use_container_width=True):
@@ -732,7 +839,6 @@ with left:
 
         with c2:
             if is_bookable_provider(provider):
-                # No key= here (compat)
                 st.link_button("Book", provider_booking_link(provider), use_container_width=True)
             else:
                 with st.popover("Plan & copy"):
@@ -754,7 +860,6 @@ with left:
                     copy_button(share_msg, key=f"copy_{pitch_id}", label="Copier le message")
                     st.code(share_msg)
 
-                    # Calendars only if plan_mode ON
                     if st.session_state.plan_mode:
                         start_local = datetime.combine(
                             st.session_state.plan_date,
@@ -769,7 +874,6 @@ with left:
                             details=share_msg,
                             location=name
                         )
-                        # No key= (compat)
                         st.link_button("Add to Google Calendar", gcal, use_container_width=True)
 
                         ics = build_ics_event(
@@ -785,13 +889,13 @@ with left:
                             file_name=f"pitchfinder_{pitch_id}.ics",
                             mime="text/calendar",
                             use_container_width=True,
-                            key=f"ics_{pitch_id}"  # ✅ unique
+                            key=f"ics_{pitch_id}"
                         )
                     else:
                         st.caption("Active 'Plan a game' (en bas) pour générer un événement calendrier.")
 
         with c3:
-            # ✅ Y aller button (Apple Maps if possible else Google)
+            # Sur mobile, button HTML peut être moins fiable mais OK
             components.html(
                 go_button_html(row["lat"], row["lon"], name, element_id=f"go_{pitch_id}".replace(",", "_")),
                 height=55
@@ -802,23 +906,34 @@ with right:
 
     radius_km_effective = float(st.session_state.last_radius_km)
 
-    st.session_state.folium_map = make_map(
-        st.session_state.origin_lat,
-        st.session_state.origin_lon,
-        df_top,
-        radius_km=radius_km_effective,
-        selected_id=st.session_state.selected_pitch_id,
-        selected_lat=st.session_state.selected_lat,
-        selected_lon=st.session_state.selected_lon
-    )
+    # ✅ Mobile: PyDeck (vite + responsive)
+    if is_mobile:
+        render_pydeck_map(
+            st.session_state.origin_lat,
+            st.session_state.origin_lon,
+            df_top,
+            selected_id=st.session_state.selected_pitch_id,
+            height=540
+        )
+        st.caption("Mode mobile: carte rapide (PyDeck). Pour la carte Folium complète, désactive le mode mobile.")
 
-    html_map = st.session_state.folium_map.get_root().render()
+    # ✅ Desktop: Folium (comme avant)
+    else:
+        m = make_folium_map(
+            st.session_state.origin_lat,
+            st.session_state.origin_lon,
+            df_top,
+            radius_km=radius_km_effective,
+            selected_id=st.session_state.selected_pitch_id,
+            selected_lat=st.session_state.selected_lat,
+            selected_lon=st.session_state.selected_lon
+        )
 
-    # ✅ Force rerender safely without using key=
-    bust = f"{st.session_state.selected_pitch_id}|{st.session_state.selected_lat}|{st.session_state.selected_lon}"
-    components.html(
-        html_map + f"\n<!-- bust:{bust} -->\n",
-        height=650,
-        width=None,
-        scrolling=False
-    )
+        html_map = m.get_root().render()
+        bust = f"{st.session_state.selected_pitch_id}|{st.session_state.selected_lat}|{st.session_state.selected_lon}"
+        components.html(
+            html_map + f"\n<!-- bust:{bust} -->\n",
+            height=650,
+            width=None,
+            scrolling=False
+        )
