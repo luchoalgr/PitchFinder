@@ -9,6 +9,23 @@ import folium
 from urllib.parse import quote_plus, urlencode
 from datetime import datetime, timedelta, timezone
 
+# =========================================================
+# PitchFinder V3.6 — FULL SCRIPT (Streamlit)
+# =========================================================
+# ✅ "Y aller" (Apple Maps if iOS/macOS UA else Google Maps)
+# ✅ "Plan a game" moved to bottom of sidebar
+# ✅ Radius up to 20km (single slider; removed "use profile radius")
+# ✅ Apple Calendar (.ics download) + Google Calendar link (only when plan_mode ON)
+# ✅ Cards: always outlined; selected outline changes color
+# ✅ Selection unique via pitch_id (fix "all selected" bug)
+# ✅ Message:
+#    - plan_mode OFF: no date/time/players
+#    - plan_mode ON: includes date/time/players + calendars
+# ✅ No key= on st.link_button (older Streamlit compatibility)
+# ✅ Unique key= on st.download_button (fix DuplicateElementId)
+# =========================================================
+
+
 # ============================
 # Session state
 # ============================
@@ -23,20 +40,28 @@ def init_state():
         "origin_lat": None,
         "origin_lon": None,
 
-        # Plan defaults (available even before first search)
+        # Plan defaults (editable anytime)
         "plan_mode": False,
         "plan_date": datetime.now().date(),
         "plan_time": datetime.now().replace(minute=0, second=0, microsecond=0).time(),
         "plan_players": 10,
-        "plan_profile": "Walking",
 
-        # User profile for stylized messages
+        # User identity for message
         "user_name": "Luc",
-        "user_style": "match",  # match or terrain
+        "user_style": "terrain",  # match or terrain
+
+        # Sticky search defaults
+        "last_address": "Bordeaux, France",
+        "last_profile_name": "Walking",
+        "last_pitch_type": "all",
+        "last_paid_filter": "show_all",
+        "last_radius_km": 5,
+        "last_top_n": 10,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
 
 init_state()
 
@@ -51,8 +76,10 @@ def haversine_km(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
-_geolocator = Nominatim(user_agent="pitchfinder_streamlit_v35_folium")
+
+_geolocator = Nominatim(user_agent="pitchfinder_streamlit_v36_folium")
 _geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1)
+
 
 def geocode_address(address: str):
     if "france" not in address.lower():
@@ -61,6 +88,7 @@ def geocode_address(address: str):
     if loc is None:
         return None
     return (loc.latitude, loc.longitude)
+
 
 # ============================
 # 2) Overpass API (OpenStreetMap)
@@ -93,6 +121,7 @@ def overpass_get_pitches(lat, lon, radius_m=3000):
 
     raise RuntimeError(f"Overpass API error (all endpoints failed). Last error: {last_error}")
 
+
 # ============================
 # 3) Providers + links
 # ============================
@@ -108,8 +137,10 @@ def detect_provider(name: str) -> str:
         return "Five (generic)"
     return "Public/Other"
 
+
 def is_bookable_provider(provider: str) -> bool:
     return provider in ("UrbanSoccer", "Le Five")
+
 
 def provider_booking_link(provider: str) -> str:
     utm = "utm_source=pitchfinder&utm_medium=referral&utm_campaign=student_project"
@@ -119,6 +150,7 @@ def provider_booking_link(provider: str) -> str:
         return f"https://lefive.fr/?{utm}"
     return ""
 
+
 def gmaps_directions_link(origin_lat, origin_lon, dest_lat, dest_lon) -> str:
     return (
         f"https://www.google.com/maps/dir/?api=1"
@@ -126,8 +158,46 @@ def gmaps_directions_link(origin_lat, origin_lon, dest_lat, dest_lon) -> str:
         f"&destination={dest_lat},{dest_lon}"
     )
 
-def gmaps_search_link(query: str) -> str:
-    return "https://www.google.com/search?q=" + quote_plus(query)
+
+def google_maps_place_link(dest_lat, dest_lon, label="Destination") -> str:
+    return f"https://www.google.com/maps/search/?api=1&query={dest_lat},{dest_lon}({quote_plus(label)})"
+
+
+def apple_maps_place_link(dest_lat, dest_lon, label="Destination") -> str:
+    return f"https://maps.apple.com/?ll={dest_lat},{dest_lon}&q={quote_plus(label)}"
+
+
+def go_button_html(dest_lat, dest_lon, label, element_id):
+    g = google_maps_place_link(dest_lat, dest_lon, label)
+    a = apple_maps_place_link(dest_lat, dest_lon, label)
+    safe_label = (label or "Destination").replace('"', "'")
+
+    return f"""
+    <button id="{element_id}" style="
+        width:100%;
+        padding:8px 12px;
+        border-radius:12px;
+        border:1px solid rgba(0,0,0,0.18);
+        background: rgba(255,255,255,0.55);
+        cursor:pointer;
+    ">🧭 Y aller</button>
+    <script>
+      (function() {{
+        const btn = document.getElementById("{element_id}");
+        const ua = navigator.userAgent || "";
+        const isApple = /iPhone|iPad|iPod|Macintosh/.test(ua);
+        const appleUrl = "{a}";
+        const googleUrl = "{g}";
+
+        btn.onclick = () => {{
+          const url = isApple ? appleUrl : googleUrl;
+          window.open(url, "_blank");
+        }};
+        btn.title = "Ouvre {safe_label} dans Apple Maps si possible, sinon Google Maps";
+      }})();
+    </script>
+    """
+
 
 # ============================
 # 4) Build DataFrame
@@ -172,10 +242,11 @@ def pitches_to_df(osm_json, user_lat, user_lon):
     df["distance_km"] = df["distance_km"].round(2)
     df["provider"] = df["name"].apply(detect_provider)
 
-    # ✅ Unique id to avoid "Unnamed pitch" selecting all
+    # ✅ Unique ID prevents multiple selection bug
     df["pitch_id"] = df.apply(lambda r: f"{r['lat']:.6f},{r['lon']:.6f}", axis=1)
 
     return df.sort_values("distance_km").reset_index(drop=True)
+
 
 # ============================
 # 5) Filters
@@ -196,27 +267,31 @@ def filter_by_pitch_type(df, pitch_type):
         ]
     return df
 
+
 def apply_paid_filter(df, paid_filter="show_all"):
     paid_filter = (paid_filter or "show_all").lower().strip()
     if paid_filter == "hide_paid":
         return df[~df["fee"].str.contains("yes|true", na=False)]
     return df
 
+
 # ============================
 # 6) Profiles + ETA + Score
 # ============================
 PROFILES = {
-    "Walking": {"mode": "walk", "max_km": 2, "prefer": ["city", "synthetic"]},
-    "Student Budget": {"mode": "walk", "max_km": 4, "prefer": ["grass", "synthetic"]},
-    "Car": {"mode": "car", "max_km": 8, "prefer": ["grass", "synthetic"]},
+    "Walking": {"mode": "walk", "prefer": ["city", "synthetic"]},
+    "Student Budget": {"mode": "walk", "prefer": ["grass", "synthetic"]},
+    "Car": {"mode": "car", "prefer": ["grass", "synthetic"]},
 }
 SPEED_KMH = {"walk": 5, "car": 30}
+
 
 def add_eta_minutes(df, mode):
     speed = SPEED_KMH.get(mode, 5)
     out = df.copy()
     out["eta_min"] = (out["distance_km"] / speed * 60).round(0).astype(int)
     return out
+
 
 def add_recommendation_score(df, profile_name, pitch_type_selected):
     profile = PROFILES[profile_name]
@@ -255,25 +330,62 @@ def add_recommendation_score(df, profile_name, pitch_type_selected):
 
     out.loc[out["fee"].str.contains("yes|true", na=False), "score_raw"] -= 15
     out["score_raw"] = out["score_raw"].clip(lower=0, upper=100).round(1)
-
-    # ✅ Only keep stars 0..5
     out["stars5"] = (out["score_raw"] / 20).round().clip(lower=0, upper=5).astype(int)
     return out
+
+
+def profile_mode_label(profile_name: str) -> str:
+    # You asked: show "car" / "walk" (not the profile name)
+    return PROFILES.get(profile_name, {}).get("mode", (profile_name or "").lower()).lower()
+
 
 # ============================
 # 7) Share + Calendar helpers
 # ============================
-def format_share_message(user_name, user_style, name, date_, time_, players, profile, dist_km, eta_min, directions_url):
+def stars_txt(n: int) -> str:
+    n = max(0, min(5, int(n)))
+    return "⭐" * n + "☆" * (5 - n)
+
+
+def format_share_message(
+    user_name,
+    user_style,
+    plan_mode,
+    name,
+    stars5,
+    profile_name,
+    dist_km,
+    eta_min,
+    directions_url,
+    date_=None,
+    time_=None,
+    players=None
+):
     intro = f"{user_name} a préparé le match ⚽" if user_style == "match" else f"{user_name} a préparé le terrain 🏟️"
+    stars_line = stars_txt(stars5)
+    prof = profile_mode_label(profile_name)
+
+    if not plan_mode:
+        return (
+            f"{intro}\n\n"
+            f"📍 {name}\n"
+            f"⭐ Rating: {stars_line}\n"
+            f"🚗 Profil: {prof}\n"
+            f"📏 {dist_km} km • ⏱ ~{eta_min} min\n"
+            f"🧭 Itinéraire: {directions_url}\n"
+        )
+
     return (
         f"{intro}\n\n"
         f"📍 {name}\n"
+        f"⭐ Rating: {stars_line}\n"
         f"🗓 {date_} • 🕒 {time_}\n"
         f"👥 {players} joueurs\n"
-        f"🚶 Profil: {profile}\n"
+        f"🚗 Profil: {prof}\n"
         f"📏 {dist_km} km • ⏱ ~{eta_min} min\n"
         f"🧭 Itinéraire: {directions_url}\n"
     )
+
 
 def google_calendar_link(title, start_dt, end_dt, details, location=""):
     start_utc = start_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -287,11 +399,42 @@ def google_calendar_link(title, start_dt, end_dt, details, location=""):
     }
     return "https://calendar.google.com/calendar/render?" + urlencode(params)
 
+
+def build_ics_event(title, start_dt, end_dt, description, location=""):
+    def esc(s: str) -> str:
+        return (s or "").replace("\\", "\\\\").replace(",", "\\,").replace(";", "\\;").replace("\n", "\\n")
+
+    dtstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dtstart = start_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dtend = end_dt.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+    uid = f"pitchfinder-{int(datetime.now().timestamp())}@local"
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//PitchFinder//V3.6//FR",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{dtstamp}",
+        f"DTSTART:{dtstart}",
+        f"DTEND:{dtend}",
+        f"SUMMARY:{esc(title)}",
+        f"DESCRIPTION:{esc(description)}",
+        f"LOCATION:{esc(location)}",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ]
+    return "\r\n".join(lines)
+
+
 def copy_button(text: str, key: str, label: str = "Copier le message"):
     safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
     components.html(
         f"""
         <button id="{key}" style="
+            width:100%;
             padding:8px 12px;
             border-radius:12px;
             border:1px solid rgba(0,0,0,0.18);
@@ -314,6 +457,7 @@ def copy_button(text: str, key: str, label: str = "Copier le message"):
         """,
         height=55
     )
+
 
 # ============================
 # 8) Map (highlight selected + center/zoom)
@@ -339,7 +483,6 @@ def make_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_l
 
     for _, row in df_top.iterrows():
         is_selected = (selected_id is not None and row["pitch_id"] == selected_id)
-
         directions = gmaps_directions_link(user_lat, user_lon, row["lat"], row["lon"])
         provider = row.get("provider", "Public/Other")
 
@@ -348,8 +491,8 @@ def make_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_l
             f"Provider: {provider}<br>"
             f"Distance: {row['distance_km']} km<br>"
             f"ETA: {row.get('eta_min','?')} min<br>"
-            f"Surface: {row['surface'] or 'n/a'}<br>"
-            f"Fee tag: {row['fee'] or 'unknown'}<br><br>"
+            f"Surface: {row.get('surface','') or 'n/a'}<br>"
+            f"Fee tag: {row.get('fee','') or 'unknown'}<br><br>"
             f"<a href='{directions}' target='_blank'>Directions (Google Maps)</a>"
         )
 
@@ -365,6 +508,7 @@ def make_map(user_lat, user_lon, df_top, radius_km, selected_id=None, selected_l
         ).add_to(m)
 
     return m
+
 
 # ============================
 # 9) UI
@@ -394,34 +538,49 @@ with st.sidebar:
             index=0 if st.session_state.user_style == "match" else 1
         )
 
-    st.session_state.plan_mode = st.checkbox("Plan a game (optional)", value=st.session_state.plan_mode)
-
+    # --- Search form (Plan moved to bottom, outside the form) ---
     with st.form("search_form"):
-        address = st.text_input("Address", value="Bordeaux, France")
+        address = st.text_input("Address", value=st.session_state.last_address)
 
-        profile_name = st.selectbox("Profile", options=list(PROFILES.keys()), index=0)
-        pitch_type = st.selectbox("Pitch type", ["all", "grass", "clay", "synthetic", "city"], index=0)
-        paid_filter = st.selectbox("Paid pitches", ["show_all", "hide_paid"], index=0)
+        profile_name = st.selectbox(
+            "Profile",
+            options=list(PROFILES.keys()),
+            index=list(PROFILES.keys()).index(st.session_state.last_profile_name)
+            if st.session_state.last_profile_name in PROFILES else 0
+        )
+        pitch_type = st.selectbox(
+            "Pitch type",
+            ["all", "grass", "clay", "synthetic", "city"],
+            index=["all", "grass", "clay", "synthetic", "city"].index(st.session_state.last_pitch_type)
+            if st.session_state.last_pitch_type in ["all", "grass", "clay", "synthetic", "city"] else 0
+        )
+        paid_filter = st.selectbox(
+            "Paid pitches",
+            ["show_all", "hide_paid"],
+            index=["show_all", "hide_paid"].index(st.session_state.last_paid_filter)
+            if st.session_state.last_paid_filter in ["show_all", "hide_paid"] else 0
+        )
 
-        st.markdown("**Radius options**")
-        use_profile_radius = st.checkbox("Use profile default radius", value=True)
-        st.caption("If checked, radius uses the profile distance. If unchecked, choose custom radius below.")
+        st.markdown("**Rayon**")
+        radius_km = st.slider("Rayon (km)", 1, 20, int(st.session_state.last_radius_km))
 
-        radius_slider = st.slider("Custom radius (km)", 1, 10, 5)
-        top_n = st.slider("Number of results", 5, 20, 10)
-
-        if st.session_state.plan_mode:
-            st.subheader("Plan details")
-            game_date = st.date_input("Date", value=st.session_state.plan_date)
-            game_time = st.time_input("Time", value=st.session_state.plan_time)
-            group_size = st.number_input("Players", min_value=2, max_value=30,
-                                         value=int(st.session_state.plan_players), step=1)
-        else:
-            game_date = st.session_state.plan_date
-            game_time = st.session_state.plan_time
-            group_size = st.session_state.plan_players
+        top_n = st.slider("Number of results", 5, 20, int(st.session_state.last_top_n))
 
         run = st.form_submit_button("Search")
+
+    st.divider()
+
+    # ✅ Plan a game at bottom, editable anytime (no need to Search first)
+    st.subheader("Plan a game")
+    st.session_state.plan_mode = st.checkbox("Plan a game (optional)", value=st.session_state.plan_mode)
+
+    if st.session_state.plan_mode:
+        st.session_state.plan_date = st.date_input("Date", value=st.session_state.plan_date)
+        st.session_state.plan_time = st.time_input("Time", value=st.session_state.plan_time)
+        st.session_state.plan_players = int(
+            st.number_input("Players", min_value=2, max_value=30, value=int(st.session_state.plan_players), step=1)
+        )
+    st.caption("Plan OFF → message sans date/heure/joueurs + pas de calendrier.")
 
 # ============================
 # 10) Run pipeline
@@ -434,14 +593,13 @@ if run:
     st.session_state.selected_lat = None
     st.session_state.selected_lon = None
 
-    st.session_state.plan_date = game_date
-    st.session_state.plan_time = game_time
-    st.session_state.plan_players = int(group_size)
-    st.session_state.plan_profile = profile_name
-
-    profile = PROFILES[profile_name]
-    radius_km_effective = profile["max_km"] if use_profile_radius else int(radius_slider)
-    radius_km_effective = min(radius_km_effective, 10)
+    # Persist latest search
+    st.session_state.last_address = address
+    st.session_state.last_profile_name = profile_name
+    st.session_state.last_pitch_type = pitch_type
+    st.session_state.last_paid_filter = paid_filter
+    st.session_state.last_radius_km = radius_km
+    st.session_state.last_top_n = top_n
 
     try:
         coords = geocode_address(address.strip())
@@ -452,21 +610,23 @@ if run:
             st.session_state.origin_lat = user_lat
             st.session_state.origin_lon = user_lon
 
-            osm = overpass_get_pitches(user_lat, user_lon, radius_m=int(radius_km_effective * 1000))
+            osm = overpass_get_pitches(user_lat, user_lon, radius_m=int(radius_km * 1000))
             df = pitches_to_df(osm, user_lat, user_lon)
 
             if df.empty:
                 st.session_state.last_error = "No pitches found. Try increasing the radius or changing the address."
             else:
-                df = df[df["distance_km"] <= profile["max_km"]].copy()
+                # Filter within chosen radius
+                df = df[df["distance_km"] <= float(radius_km)].copy()
                 if df.empty:
-                    st.session_state.last_error = "No pitches within the profile max distance."
+                    st.session_state.last_error = "No pitches within the selected radius."
                 else:
                     df = apply_paid_filter(df, paid_filter=paid_filter)
                     if df.empty:
                         st.session_state.last_error = "No pitches after paid filter."
                     else:
-                        df = add_eta_minutes(df, profile["mode"])
+                        mode = PROFILES[profile_name]["mode"]
+                        df = add_eta_minutes(df, mode)
                         df = add_recommendation_score(df, profile_name, pitch_type)
 
                         df_filtered = filter_by_pitch_type(df, pitch_type)
@@ -479,8 +639,8 @@ if run:
                         ).reset_index(drop=True)
 
                         df_top = df_ranked.head(int(top_n)).copy()
-
                         st.session_state.df_top = df_top
+
                         if not df_top.empty:
                             st.session_state.selected_pitch_id = df_top.iloc[0]["pitch_id"]
                             st.session_state.selected_lat = float(df_top.iloc[0]["lat"])
@@ -506,14 +666,10 @@ if df_top.empty:
 
 left, right = st.columns([1.25, 1])
 
-def stars_txt(n: int) -> str:
-    n = max(0, min(5, int(n)))
-    return "⭐" * n + "☆" * (5 - n)
-
 with left:
     st.subheader("Top results")
 
-    for i, row in df_top.iterrows():
+    for _, row in df_top.iterrows():
         pitch_id = row["pitch_id"]
         name = row["name"]
         provider = row.get("provider", "Public/Other")
@@ -529,7 +685,7 @@ with left:
 
         is_sel = (pitch_id == st.session_state.selected_pitch_id)
 
-        # ✅ Every card has outline, selected changes color + accent
+        # ✅ Every card has outline; selected changes color
         border = "2px solid #ff8c00" if is_sel else "1.5px solid rgba(0,0,0,0.18)"
         bg = "rgba(255,140,0,0.06)" if is_sel else "rgba(255,255,255,0.02)"
         shadow = "0 6px 18px rgba(0,0,0,0.10)" if is_sel else "0 2px 8px rgba(0,0,0,0.06)"
@@ -564,10 +720,11 @@ with left:
             unsafe_allow_html=True
         )
 
-        c1, c2 = st.columns([1, 1])
+        # Actions: Highlight | Plan&Copy/Book | Y aller
+        c1, c2, c3 = st.columns([1, 1, 1])
 
         with c1:
-            if st.button("📍 Highlight on map", key=f"hl_{pitch_id}", use_container_width=True):
+            if st.button("📍 Highlight", key=f"hl_{pitch_id}", use_container_width=True):
                 st.session_state.selected_pitch_id = pitch_id
                 st.session_state.selected_lat = float(row["lat"])
                 st.session_state.selected_lon = float(row["lon"])
@@ -575,48 +732,81 @@ with left:
 
         with c2:
             if is_bookable_provider(provider):
+                # No key= here (compat)
                 st.link_button("Book", provider_booking_link(provider), use_container_width=True)
             else:
                 with st.popover("Plan & copy"):
-                    if not st.session_state.plan_mode:
-                        st.info("Active 'Plan a game' dans la sidebar pour régler date/heure/joueurs (sinon valeurs par défaut).")
-
                     share_msg = format_share_message(
                         user_name=st.session_state.user_name,
                         user_style=st.session_state.user_style,
+                        plan_mode=st.session_state.plan_mode,
                         name=name,
-                        date_=st.session_state.plan_date.strftime("%Y-%m-%d"),
-                        time_=st.session_state.plan_time.strftime("%H:%M"),
-                        players=st.session_state.plan_players,
-                        profile=st.session_state.plan_profile,
+                        stars5=stars5,
+                        profile_name=st.session_state.last_profile_name,
                         dist_km=dist,
                         eta_min=eta,
-                        directions_url=directions
+                        directions_url=directions,
+                        date_=st.session_state.plan_date.strftime("%Y-%m-%d"),
+                        time_=st.session_state.plan_time.strftime("%H:%M"),
+                        players=st.session_state.plan_players
                     )
 
                     copy_button(share_msg, key=f"copy_{pitch_id}", label="Copier le message")
                     st.code(share_msg)
 
-                    start_dt = datetime.combine(st.session_state.plan_date, st.session_state.plan_time).replace(tzinfo=timezone.utc)
-                    end_dt = start_dt + timedelta(hours=1)
-                    gcal = google_calendar_link(
-                        title=f"Football — {name}",
-                        start_dt=start_dt,
-                        end_dt=end_dt,
-                        details=share_msg,
-                        location=name
-                    )
-                    st.link_button("Add to Google Calendar", gcal)
+                    # Calendars only if plan_mode ON
+                    if st.session_state.plan_mode:
+                        start_local = datetime.combine(
+                            st.session_state.plan_date,
+                            st.session_state.plan_time
+                        ).astimezone()
+                        end_local = start_local + timedelta(hours=1)
+
+                        gcal = google_calendar_link(
+                            title=f"Football — {name}",
+                            start_dt=start_local,
+                            end_dt=end_local,
+                            details=share_msg,
+                            location=name
+                        )
+                        # No key= (compat)
+                        st.link_button("Add to Google Calendar", gcal, use_container_width=True)
+
+                        ics = build_ics_event(
+                            title=f"Football — {name}",
+                            start_dt=start_local,
+                            end_dt=end_local,
+                            description=share_msg,
+                            location=name
+                        )
+                        st.download_button(
+                            "Add to Apple Calendar (.ics)",
+                            data=ics.encode("utf-8"),
+                            file_name=f"pitchfinder_{pitch_id}.ics",
+                            mime="text/calendar",
+                            use_container_width=True,
+                            key=f"ics_{pitch_id}"  # ✅ unique
+                        )
+                    else:
+                        st.caption("Active 'Plan a game' (en bas) pour générer un événement calendrier.")
+
+        with c3:
+            # ✅ Y aller button (Apple Maps if possible else Google)
+            components.html(
+                go_button_html(row["lat"], row["lon"], name, element_id=f"go_{pitch_id}".replace(",", "_")),
+                height=55
+            )
 
 with right:
     st.subheader("Map")
 
-    profile_max_km = PROFILES[st.session_state.plan_profile]["max_km"]
+    radius_km_effective = float(st.session_state.last_radius_km)
+
     st.session_state.folium_map = make_map(
         st.session_state.origin_lat,
         st.session_state.origin_lon,
         df_top,
-        radius_km=profile_max_km,
+        radius_km=radius_km_effective,
         selected_id=st.session_state.selected_pitch_id,
         selected_lat=st.session_state.selected_lat,
         selected_lon=st.session_state.selected_lon
@@ -624,7 +814,7 @@ with right:
 
     html_map = st.session_state.folium_map.get_root().render()
 
-    # ✅ Force rerender safely (no key param)
+    # ✅ Force rerender safely without using key=
     bust = f"{st.session_state.selected_pitch_id}|{st.session_state.selected_lat}|{st.session_state.selected_lon}"
     components.html(
         html_map + f"\n<!-- bust:{bust} -->\n",
