@@ -37,6 +37,47 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+    /* Header responsive */
+    .pf-header{
+        display:flex;
+        align-items:baseline;
+        gap:12px;
+        flex-wrap:wrap;
+    }
+    .pf-title{
+        margin:0;
+        font-weight:800;
+        line-height:1.05;
+        font-size:44px;
+    }
+    .pf-sub{
+        opacity:0.75;
+        font-size:16px;
+        line-height:1.2;
+        margin-top:6px;
+    }
+
+    /* Mobile */
+    @media (max-width: 768px){
+        .pf-header{ flex-direction:column; align-items:flex-start; gap:6px; }
+        .pf-title{ font-size:30px; }
+        .pf-sub{ font-size:14px; }
+    }
+
+    /* Very small phones */
+    @media (max-width: 380px){
+        .pf-title{ font-size:26px; }
+        .pf-sub{ display:none; }  /* option: cache le sous-titre */
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+st.markdown(
+    """
+    <style>
     .pf-title { font-size: 44px; font-weight: 800; margin: 0; }
     .pf-sub { color: #6b7280; margin-top: -6px; }
     .pf-muted { color:#6b7280; }
@@ -601,13 +642,14 @@ def render_pydeck_map(origin_lat, origin_lon, df_top, selected_id=None, height=5
 # ============================
 st.markdown(
     """
-    <div style="display:flex; align-items:baseline; gap:12px;">
-      <h1 style="margin:0;">⚽ PitchFinder</h1>
-      <span style="opacity:0.75;">Find & plan football games around any address</span>
+    <div class="pf-header">
+      <div class="pf-title">⚽ PitchFinder</div>
+      <div class="pf-sub">Find & plan football games around any address</div>
     </div>
     """,
     unsafe_allow_html=True
 )
+
 st.caption("ETA = Estimated Travel Time (minutes), based on your selected profile (walk/car).")
 
 # ============================
